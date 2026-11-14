@@ -1,0 +1,558 @@
+/* Глаголы, инвентарь и строка предложения (банк A): перевод engines/scumm/verbs.cpp
+ * (v2: initV2MouseOver, checkV2MouseOver, checkV2Inventory, redrawV2Inventory,
+ * checkExecVerbs, handleMouseOver) и o2_drawSentence из script_v2.cpp.
+ * Координаты — точки экрана MM 320x200; область глаголов начинается со строки 144. */
+#include "vm.h"
+
+#define VERB_TOP 144
+#define MAX_VERBS 32          /* ScummVM: 100; MM занимает слоты до ~22 */
+
+/* VerbSlot: 32 байта; координаты — точки экрана (curRect в ScummVM) */
+struct VerbSlot
+{
+    int16_t left, top, right, bottom;
+    int16_t old_left, old_top, old_right, old_bottom;
+    uint8_t verbid, color, hicolor, dimcolor, curmode, key, prep, saveid;
+    uint8_t name_page, pad;
+    uint16_t name_addr;
+    uint8_t pad2[4];
+};
+
+static struct VerbSlot verbs[MAX_VERBS];
+static uint8_t verbMouseOverSlot;
+static int8_t mouseOverBoxV2 = -1;
+static uint8_t inventoryOffset;
+
+
+/* verbs.cpp: initV2MouseOver — прямоугольники относительно области глаголов */
+struct Box8 { int16_t l, t, r, b; };
+static const struct Box8 mouseOverBoxes[7] =
+{
+    { 0, 32, 144, 40 }, { 176, 32, 320, 40 }, { 0, 40, 144, 48 }, { 176, 40, 320, 48 },
+    { 144, 32, 176, 40 },   /* kInventoryUpArrow */
+    { 144, 40, 176, 48 },   /* kInventoryDownArrow */
+    { 0, 0, 320, 8 },       /* kSentenceLine */
+};
+static const uint8_t mo_color[7] = { 13, 13, 13, 13, 1, 1, 13 };
+#define HI_COLOR 14
+enum { kInventoryUpArrow = 4, kInventoryDownArrow = 5, kSentenceLine = 6 };
+
+/* findVerbAtPos по тем же (x, y) и неизменным глаголам — прежний ответ */
+static int16_t fv_x = -1, fv_y;
+static uint8_t fv_r;
+
+void verbs_reset(void)
+{
+    fv_x = -1;
+    for (uint8_t i = 0; i < MAX_VERBS; i++)
+    {
+        verbs[i].verbid = 0;
+        verbs[i].right = 319;
+        verbs[i].old_left = -1;
+        verbs[i].color = 2;
+        verbs[i].hicolor = 0;
+        verbs[i].curmode = 0;
+        verbs[i].saveid = 0;
+        verbs[i].key = 0;
+        verbs[i].name_page = 0;
+    }
+    mouseOverBoxV2 = -1;
+}
+
+static struct VerbSlot *V(uint8_t slot)
+{
+    if (slot >= MAX_VERBS) fatal("VERB SLOT", slot);
+    return &verbs[slot];
+}
+
+uint8_t verb_name(uint8_t slot, uint16_t *addr)
+{
+    *addr = V(slot)->name_addr;
+    return V(slot)->name_page;
+}
+
+/* script_v2.cpp: o2_verbOps — новый глагол */
+void verbOps_new(uint8_t slot, uint8_t verbid, uint8_t x, uint8_t y, uint8_t prep)
+{
+    /* ScummVM — места QWERT/ASDFG/ZXCVB клавиатуры ПК; на БК (ЙЦУКЕН) там Й Ц У К Е /
+     * Ф Ы В А П / Я Ч С М И: коды ЛАТ J C U K E / F Y W A P / Q ^ S M I (input_poll —
+     * строчные, ^ -> ~) */
+    static const char keyboard[] = "jcukefywapq~smi";
+    struct VerbSlot *vs = V(slot);
+    if (slot == 0) fatal("VERB 0", 0);
+    fv_x = -1;
+    vs->verbid = verbid;
+    vs->color = 2;
+    vs->hicolor = 14;
+    vs->dimcolor = 8;
+    vs->curmode = 1;
+    vs->saveid = 0;
+    vs->key = 0;
+    vs->prep = prep;
+    vs->left = (int16_t)(x * 8);
+    vs->top = (int16_t)(y * 8);
+    if (slot >= 1 && slot <= 15) vs->key = (uint8_t)keyboard[slot - 1];
+    if (vs->name_page) res_free(vs->name_page, vs->name_addr);
+    vs->name_page = loadPtrToResource();
+    vs->name_addr = res_addr;
+}
+
+void verb_set_mode(uint8_t slot, uint8_t mode)
+{
+    V(slot)->curmode = mode;
+    fv_x = -1;
+}
+
+/* verbs.cpp: getVerbSlot */
+uint8_t getVerbSlot(uint8_t id, uint8_t mode)
+{
+    for (uint8_t i = 1; i < MAX_VERBS; i++)
+        if (verbs[i].verbid == id && verbs[i].saveid == mode) return i;
+    return 0;
+}
+
+/* verbs.cpp: restoreVerbBG */
+static void restoreVerbBG(struct VerbSlot *vs)
+{
+    if (vs->old_left != -1)
+    {
+        screen_clear_rect(vs->old_left, vs->old_top, vs->old_right, vs->old_bottom);
+        vs->old_left = -1;
+    }
+}
+
+static void drawFarString(int16_t x, int16_t y, uint8_t color, uint8_t page, uint16_t addr, uint8_t max, int16_t *right)
+{
+    uint8_t buf[41];   /* одним чтением, а не far_rb на знак */
+    far_rd(buf, page, addr, max);
+    buf[max] = 0;
+    *right = charset_drawString(x, y, color, buf);
+}
+
+/* verbs.cpp: drawVerb. Тот же текст на том же месте (подсветка под курсором) — без
+ * стирания: знак сам чистит свою клетку, а стирание с перепечаткой было видно построчно */
+void drawVerb(uint8_t verb, uint8_t mode)
+{
+    if (!verb) return;
+    struct VerbSlot *vs = V(verb);
+    fv_x = -1;
+    if (!vs->saveid && vs->curmode && vs->verbid)
+    {
+        uint8_t color;
+        if (vs->curmode == 2) color = vs->dimcolor;
+        else if (mode && vs->hicolor) color = vs->hicolor;
+        else color = vs->color;
+        if (!vs->name_page)
+        {
+            restoreVerbBG(vs);
+            return;
+        }
+        uint8_t buf[41];   /* имя одним чтением, а не far_rb на знак */
+        far_rd(buf, vs->name_page, vs->name_addr, 40);
+        buf[40] = 0;
+        int16_t right = vs->left;
+        for (const uint8_t *c = buf; *c; c++)
+            if (*c != '@') right += 8;
+        if (vs->old_left != vs->left || vs->old_top != vs->top || vs->old_right != right) restoreVerbBG(vs);
+        charset_drawString(vs->left, vs->top, color, buf);
+        vs->right = right;
+        vs->bottom = vs->top + 8;
+        vs->old_left = vs->left;
+        vs->old_top = vs->top;
+        vs->old_right = right;
+        vs->old_bottom = vs->bottom;
+    }
+    else
+        restoreVerbBG(vs);
+}
+
+/* verbs.cpp: killVerb */
+void killVerb(uint8_t slot)
+{
+    if (slot == 0) return;
+    struct VerbSlot *vs = V(slot);
+    fv_x = -1;
+    vs->verbid = 0;
+    vs->curmode = 0;
+    if (vs->name_page)
+    {
+        res_free(vs->name_page, vs->name_addr);
+        vs->name_page = 0;
+    }
+    if (vs->saveid == 0)
+    {
+        drawVerb(slot, 0);
+        verbMouseOver(0);
+    }
+    vs->saveid = 0;
+}
+
+/* verbs.cpp: findVerbAtPos */
+static uint8_t findVerbAtPos(int16_t x, int16_t y)
+{
+    if (x == fv_x && y == fv_y) return fv_r;
+    fv_x = x;
+    fv_y = y;
+    uint8_t i;
+    for (i = MAX_VERBS - 1; i > 0; i--)
+    {
+        struct VerbSlot *vs = &verbs[i];
+        if (vs->curmode != 1 || !vs->verbid || vs->saveid || y < vs->top || y >= vs->bottom) continue;
+        if (x < vs->left || x >= vs->right) continue;
+        break;
+    }
+    return fv_r = i;
+}
+
+/* verbs.cpp: verbMouseOver */
+void verbMouseOver(uint8_t verb)
+{
+    if (!(userState & USERSTATE_IFACE_VERBS)) return;
+    if (verbMouseOverSlot != verb)
+    {
+        drawVerb(verbMouseOverSlot, 0);
+        verbMouseOverSlot = verb;
+        if (verbs[verb].hicolor)
+        {
+            drawVerb(verb, 1);
+            verbMouseOverSlot = verb;
+        }
+    }
+}
+
+/* что сейчас на экране в строке предложения и в инвентаре: тот же текст заново не
+ * стирается и не рисуется (o2_drawSentence и runInventoryScript зовут часто) */
+static uint8_t shown_ok;            /* бит 0 — строка предложения, 1 — инвентарь, 2 — глаголы */
+static uint8_t shown_sent[80];
+static uint16_t shown_inv[9];
+
+/* verbs.cpp: redrawVerbs */
+void redrawVerbs(void)
+{
+    shown_ok |= 4;   /* зовут после очистки области: глаголы — для нынешнего userState */
+    if (!(userState & USERSTATE_IFACE_VERBS)) return;
+    uint8_t verb = 0;
+    if (cursorState > 0) verb = findVerbAtPos(mouse_x, mouse_y);
+    for (uint8_t i = 0; i < MAX_VERBS; i++)
+    {
+        if (i == verb && verbs[verb].hicolor) drawVerb(i, 1);
+        else drawVerb(i, 0);
+    }
+    verbMouseOverSlot = verb;
+}
+
+
+void verbs_forget(void)
+{
+    shown_ok = 0;
+}
+
+/* setUserState без смены интерфейса (конец катсцены после cursorCommand): глаголы и
+ * инвентарь на экране верны — только подсветка под курсором и пустая строка
+ * предложения (restoreBackground); 0 — область не нарисована, нужна целиком */
+uint8_t verbs_same_state(void)
+{
+    if (!(shown_ok & 4)) return 0;
+    if (userState & USERSTATE_IFACE_VERBS) verbMouseOver(cursorState > 0 ? findVerbAtPos(mouse_x, mouse_y) : 0);
+    if (!(shown_ok & 1) || shown_sent[0])
+    {
+        screen_clear_rect(0, VERB_TOP, 320, VERB_TOP + 8);
+        shown_sent[0] = 0;
+        shown_ok |= 1;
+    }
+    redrawV2Inventory();   /* runInventoryScript(1): тот же — без вывода */
+    return 1;
+}
+
+/* setUserState: очистка всей области глаголов и инвентаря */
+void clearVerbArea(void)
+{
+    screen_clear_rect(0, VERB_TOP, 320, VERB_TOP + 8 * 88 > 200 ? 200 : VERB_TOP + 8 * 88);
+    shown_ok = 0;
+}
+
+/* verbs.cpp: ScummEngine_v2::redrawV2Inventory */
+void redrawV2Inventory(void)
+{
+    if (!(userState & USERSTATE_IFACE_INVENTORY))
+    {
+        mouseOverBoxV2 = -1;
+        return;
+    }
+    uint8_t ego = (uint8_t)VAR(VAR_EGO);
+    int16_t cnt = (int16_t)getInventoryCount(ego), max_inv = cnt - inventoryOffset;
+    if (max_inv > 4) max_inv = 4;
+    uint16_t key[9];   /* имена (страница, адрес) и стрелки */
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < 8; i++) key[i] = 0;
+    for (; n < max_inv; n++)
+    {
+        uint16_t obj = findInventory(ego, (uint8_t)(n + 1 + inventoryOffset));
+        if (obj == 0) break;
+        uint16_t a;
+        uint8_t pg = getObjOrActorName(obj, &a);
+        if (!pg) fatal("INV NAME", obj);
+        key[n * 2] = pg;
+        key[n * 2 + 1] = a;
+    }
+    key[8] = (uint16_t)(n | (inventoryOffset > 0 ? 0x100 : 0) | (inventoryOffset + 4 < cnt ? 0x200 : 0));
+    uint8_t same = shown_ok & 2;
+    for (uint8_t i = 0; i < 9; i++)
+    {
+        if (shown_inv[i] != key[i]) same = 0;
+        shown_inv[i] = key[i];
+    }
+    if (same) return;   /* подсветка (mouseOverBoxV2) на экране тоже прежняя */
+    shown_ok |= 2;
+    mouseOverBoxV2 = -1;
+    screen_clear_rect(0, VERB_TOP + 32, 320, 200);
+    for (uint8_t i = 0; i < n; i++)
+    {
+        int16_t right;
+        drawFarString(mouseOverBoxes[i].l, mouseOverBoxes[i].t + VERB_TOP, mo_color[i], (uint8_t)key[i * 2], key[i * 2 + 1], 18, &right);
+    }
+    uint8_t arrow[4] = { ' ', 1, 2, 0 };   /* на стеке: строку читает банк C */
+    if (key[8] & 0x100)
+        charset_drawString(mouseOverBoxes[kInventoryUpArrow].l, mouseOverBoxes[kInventoryUpArrow].t + VERB_TOP,
+                           mo_color[kInventoryUpArrow], arrow);
+    arrow[1] = 3;
+    arrow[2] = 4;
+    if (key[8] & 0x200)
+        charset_drawString(mouseOverBoxes[kInventoryDownArrow].l, mouseOverBoxes[kInventoryDownArrow].t + VERB_TOP,
+                           mo_color[kInventoryDownArrow], arrow);
+}
+
+/* verbs.cpp: checkV2MouseOver — подсветка перерисовкой текста цветом выделения */
+static void checkV2MouseOver(void)
+{
+    if (!(userState & USERSTATE_IFACE_INVENTORY))
+    {
+        mouseOverBoxV2 = -1;
+        return;
+    }
+    int8_t new_box = -1;
+    if (cursorState > 0)
+        for (uint8_t i = 0; i < 7; i++)
+        {
+            const struct Box8 *b = &mouseOverBoxes[i];
+            int16_t y = mouse_y - VERB_TOP;
+            if (mouse_x >= b->l && mouse_x < b->r && y >= b->t && y < b->b)
+            {
+                new_box = (int8_t)i;
+                break;
+            }
+        }
+    if (new_box != mouseOverBoxV2)
+    {
+        if (mouseOverBoxV2 != -1)
+        {
+            const struct Box8 *b = &mouseOverBoxes[mouseOverBoxV2];
+            screen_recolor(b->l, b->t + VERB_TOP, b->r, b->b + VERB_TOP, HI_COLOR, mo_color[mouseOverBoxV2]);
+        }
+        if (new_box != -1)
+        {
+            const struct Box8 *b = &mouseOverBoxes[new_box];
+            screen_recolor(b->l, b->t + VERB_TOP, b->r, b->b + VERB_TOP, mo_color[new_box], HI_COLOR);
+        }
+        mouseOverBoxV2 = new_box;
+    }
+}
+
+/* verbs.cpp: ScummEngine_v2::handleMouseOver */
+/* между шагами (main.c): мышь сдвинулась — подсветка глагола и предмета инвентаря и
+ * курсор сразу, как сделает следующий шаг (handleMouseOver) */
+void ui_hover(void)
+{
+#ifndef HOST
+    extern int16_t joy_dx, joy_dy;   /* как joy_take (platform.c), но щелчок — шагу */
+    __asm__ volatile("mtps $0340");
+    mouse_x += joy_dx;
+    mouse_y += joy_dy >> 1;
+    joy_dy &= 1;
+    joy_dx = 0;
+    __asm__ volatile("mtps $0");
+#endif
+    if (mouse_x < 0) mouse_x = 0;
+    if (mouse_x > 319) mouse_x = 319;
+    if (mouse_y < 0) mouse_y = 0;
+    if (mouse_y > 199) mouse_y = 199;
+    if (cursorState > 0) verbMouseOver(findVerbAtPos(mouse_x, mouse_y));
+    checkV2MouseOver();
+    cursor_move();
+}
+
+void handleMouseOver(uint8_t updateInventory)
+{
+    if (cursorState > 0) verbMouseOver(findVerbAtPos(mouse_x, mouse_y));
+    if (updateInventory) inventoryOffset = 0;
+    if (updateInventory) redrawV2Inventory();
+    checkV2MouseOver();
+}
+
+/* verbs.cpp: checkV2Inventory */
+static uint16_t checkV2Inventory(int16_t x, int16_t y)
+{
+    y -= VERB_TOP;
+    if (y < 32) return 0;
+    uint8_t ego = (uint8_t)VAR(VAR_EGO);
+    const struct Box8 *b = &mouseOverBoxes[kInventoryUpArrow];
+    if (x >= b->l && x < b->r && y >= b->t && y < b->b)
+    {
+        if (inventoryOffset >= 2)
+        {
+            inventoryOffset -= 2;
+            redrawV2Inventory();
+        }
+    }
+    b = &mouseOverBoxes[kInventoryDownArrow];
+    if (x >= b->l && x < b->r && y >= b->t && y < b->b)
+        if (inventoryOffset + 4 < getInventoryCount(ego))
+        {
+            inventoryOffset += 2;
+            redrawV2Inventory();
+        }
+    uint8_t object;
+    for (object = 0; object < 4; object++)
+    {
+        b = &mouseOverBoxes[object];
+        if (x >= b->l && x < b->r && y >= b->t && y < b->b) break;
+    }
+    if (object >= 4) return 0;
+    return findInventory(ego, (uint8_t)(object + 1 + inventoryOffset));
+}
+
+/* verbs.cpp: ScummEngine_v2::checkExecVerbs. mouseAndKeyboardStat: клавиша (<0x200),
+ * 0x8000 — щелчок левой, 0x4000 — правой (MBS_LEFT_CLICK / MBS_RIGHT_CLICK) */
+void checkExecVerbs(void)
+{
+    uint16_t stat = mouseAndKeyboardStat;
+    if (userPut <= 0 || stat == 0) return;
+    if (stat < 0x200)
+    {
+        for (uint8_t i = 1; i < MAX_VERBS; i++)
+        {
+            struct VerbSlot *vs = &verbs[i];
+            if (vs->verbid && vs->saveid == 0 && vs->curmode == 1 && stat == vs->key)
+            {
+                runInputScript(kVerbClickArea, vs->verbid, 1);
+                return;
+            }
+        }
+        int8_t object = -1;
+        uint8_t ego = (uint8_t)VAR(VAR_EGO);
+        switch (stat)   /* места U, J, I O, K L ПК — на БК Г, О, Ш Щ, Л Д */
+        {
+        case 'g':
+            if (inventoryOffset >= 2)
+            {
+                inventoryOffset -= 2;
+                redrawV2Inventory();
+            }
+            return;
+        case 'o':
+            if (inventoryOffset + 4 < getInventoryCount(ego))
+            {
+                inventoryOffset += 2;
+                redrawV2Inventory();
+            }
+            return;
+        case '{': object = 0; break;
+        case '}': object = 1; break;
+        case 'l': object = 2; break;
+        case 'd': object = 3; break;
+        }
+        if (object != -1)
+        {
+            uint16_t obj = findInventory(ego, (uint8_t)(object + 1 + inventoryOffset));
+            if (obj > 0) runInputScript(kInventoryClickArea, obj, 0);
+            return;
+        }
+        runInputScript(kKeyClickArea, stat, 1);
+        return;
+    }
+    uint8_t code = (stat & 0x8000) ? 1 : 2;
+    /* ScummVM: <= topline + 8 и > topline + 32 — строка y 152 (верх первого ряда
+     * глаголов) шла как щелчок по строке предложения; курсор с клавиатуры (шаг 4)
+     * стоит на ней часто. Границы — по выводу: предложение 144..151, инвентарь с 176 */
+    if (mouse_y >= VERB_TOP && mouse_y < VERB_TOP + 8)
+        runInputScript(kSentenceClickArea, 0, 0);
+    else if (mouse_y >= VERB_TOP + 32)
+    {
+        uint16_t object = checkV2Inventory(mouse_x, mouse_y);
+        if (object > 0) runInputScript(kInventoryClickArea, object, 0);
+    }
+    else
+    {
+        uint8_t over = findVerbAtPos(mouse_x, mouse_y);
+        if (over != 0)
+            runInputScript(kVerbClickArea, verbs[over].verbid, code);
+        else if (mouse_y >= 16 && mouse_y < VERB_TOP)
+            runInputScript(kSceneClickArea, 0, code);
+        else if (mouse_y >= VERB_TOP)
+            runInputScript(kVerbClickArea, 0, code);
+    }
+}
+
+/* script_v2.cpp: o2_drawSentence */
+void drawSentence(void)
+{
+    if (!(userState & USERSTATE_IFACE_SENTENCE)) return;
+    uint8_t slot = getVerbSlot((uint8_t)VAR(VAR_SENTENCE_VERB), 0);
+    if (!slot || !verbs[slot].name_page) return;
+    uint8_t buf[80];
+    uint8_t n = 0;
+    uint16_t a;
+    uint8_t pg = verbs[slot].name_page;
+    a = verbs[slot].name_addr;
+    while (n < 40 && (buf[n] = far_rb(pg, a + n)) != 0) n++;
+    if (VAR(VAR_SENTENCE_OBJECT1) > 0)
+    {
+        pg = getObjOrActorName((uint16_t)VAR(VAR_SENTENCE_OBJECT1), &a);
+        if (pg)
+        {
+            buf[n++] = ' ';
+            for (uint8_t k = 0; n < 78 && (buf[n] = far_rb(pg, a + k)) != 0; k++) n++;
+        }
+    }
+    int16_t prep = VAR(VAR_SENTENCE_PREPOSITION);
+    if (prep > 0 && prep <= 4)
+    {
+        static const char *const prepositions[5] = { " ", " in", " with", " on", " to" };
+        for (const char *p = prepositions[prep]; *p && n < 78; p++) buf[n++] = (uint8_t)*p;
+    }
+    if (VAR(VAR_SENTENCE_OBJECT2) > 0)
+    {
+        pg = getObjOrActorName((uint16_t)VAR(VAR_SENTENCE_OBJECT2), &a);
+        if (pg)
+        {
+            buf[n++] = ' ';
+            for (uint8_t k = 0; n < 78 && (buf[n] = far_rb(pg, a + k)) != 0; k++) n++;
+        }
+    }
+    buf[n] = 0;
+    /* не больше 40 печатных знаков ('@' не считается) */
+    uint8_t len = 0, i = 0, out[80], j = 0;
+    while (buf[i])
+    {
+        if (buf[i] != '@') len++;
+        if (len > 40) break;
+        out[j++] = buf[i++];
+    }
+    out[j] = 0;
+    uint8_t same = shown_ok & 1;
+    for (i = 0; i <= j; i++)
+    {
+        if (shown_sent[i] != out[i]) same = 0;
+        shown_sent[i] = out[i];
+    }
+    if (same) return;
+    shown_ok |= 1;
+    screen_clear_rect(0, VERB_TOP, 320, VERB_TOP + 8);
+    charset_drawString(0, VERB_TOP, 13, out);
+}
+
+/* сохранение игры: имена глаголов в куче (sv_heap) */
+void heapV(uint8_t mode)
+{
+    for (uint8_t i = 0; i < MAX_VERBS; i++) sv_heap(&verbs[i].name_page, &verbs[i].name_addr, 1, mode);
+}

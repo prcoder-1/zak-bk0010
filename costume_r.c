@@ -1,0 +1,1367 @@
+/* Отрисовка актёров (банк B): перевод ClassicCostumeRenderer (costume.cpp:
+ * drawLimb / mainRoutine / proc3, base-costume.cpp: drawCostume /
+ * codec1_ignorePakCols) и Actor_v2::prepareDrawActorCostume (actor.cpp) для
+ * костюмов v2 (формат 0x58, GF_OLD_BUNDLE, без масштабирования).
+ *
+ * Координаты — точки главного виртуального экрана MM (320x128). Сжатие 4:5 — в
+ * сетке актёра: мир сдвинут на v_D так, что якорь актёра — в фазе 0 (колонка
+ * x - v_D с остатком 4 от деления на 5 пропускается, остальные встают в точку
+ * BK_X(x - v_D) + v_sh - view0; view0 — начало видимой части, кратное 4), узор
+ * цвета — по чётности точки в этой сетке. Фигура при ходьбе не меняется (у фона
+ * сетка мира: точка актёра правее не больше чем на 1). Кадр конечности (RLE)
+ * копируется в _band; proc3 (proc3.s) читает z-маску (по колонке мира) прямо в её
+ * странице и пишет в видеопамять или в холст. Конечность, видимая целиком по x и
+ * без маски глубины, рисуется в холст из кэша спрайтов (готовые байты БК в сетке
+ * актёра, при выводе — сдвиг на 0..3 точки и маска глубины). Маска глубины
+ * точки — по колонке фона под ней (5 * байт фона + точка в байте). */
+#include "actor.h"
+#include "gfx.h"
+
+#define VIEW_ROW 44                 /* строка БК начала комнаты: 28 + 16 */
+#define OUT_W 320
+#define OUT_H 128
+#ifdef HOST
+extern uint8_t host_vram[040000];
+#define vram host_vram
+extern uint8_t band[2048];
+#else
+#define vram ((volatile uint8_t *)040000)
+extern uint8_t band[2048], bounce[256];   /* sys.ld */
+#endif
+
+/* цвет EGA -> 2x2 цветов БК: узоры актёров палитры комнаты pal_want (pal11a.s,
+ * tools/pal11.py: кожа, черты лица и волосы различимы); на хосте — узоры фона */
+#ifdef HOST
+#define APAT(c) cur_pat[c]
+#else
+extern const uint8_t pal_apat[16][16], apat_pats[][4];
+#define APAT(c) apat_pats[pal_apat[pal_want][c]]
+#endif
+static const uint8_t pix_mask[4] = { 03, 014, 060, 0300 };
+static const uint8_t pix_val[4][4] = { {0, 1, 2, 3}, {0, 4, 010, 014}, {0, 020, 040, 060}, {0, 0100, 0200, 0300} };
+static const uint8_t revBitMask[8] = { 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01 };
+
+/* состояние рендерера (ClassicCostumeRenderer); не static — его читает limb.s */
+int16_t actorX, actorY, xmove, ymove, width, height;
+uint8_t mirror, zbuf, cpal[16];
+uint8_t c_page, c_cost;
+uint16_t c_res;
+static uint16_t c_frameOffsets, c_animCmds;
+static uint8_t c_palette0, c_fmt;
+uint16_t srcptr;       /* адрес кадра в странице костюма */
+int16_t draw_top, draw_bottom, draw_left, draw_right;
+int16_t xstart;        /* _virtscr[kMainVirtScreen].xstart */
+int16_t v_D, v_sh;     /* сетка актёра: сдвиг мира (-20..-1) и точек БК */
+static uint16_t view0;        /* точка БК мира в левом крае экрана */
+
+/* прямоугольник, занятый актёром в прошлом кадре (для восстановления фона) */
+struct DrawnRect { int16_t l, t, r, b; };
+static struct DrawnRect drawn[NUM_ACTORS];
+static uint8_t pl[NUM_ACTORS], npl;   /* нарисованные в прошлый раз (processActors) */
+static uint8_t strip_usage[41][4];   /* gfxUsageBits: актёры по полосам мира от xstart / 8 */
+
+static uint16_t bk_x(int16_t x)
+{
+    return BK_X(x);
+}
+
+/* costume.cpp: ClassicCostumeLoader::loadCostume для рендерера (как в costume.c) */
+static uint8_t loadCostume(uint8_t id)
+{
+    const struct CostInfo *ci = cost_info(id);
+    if (!ci) return 0;
+    c_page = ci->page;
+    c_cost = id;
+    c_res = ci->res;
+    c_fmt = ci->fmt;
+    c_palette0 = ci->palette0;
+    c_frameOffsets = ci->ptr + 2;
+    c_animCmds = ci->animCmds;
+    return 1;
+}
+
+/* цель отрисовки: видеопамять или буфер в PG_MASK (draw_via_canvas) */
+struct Target { uint16_t base, stride, bxlim, ylim, view0, page; int16_t y0; };
+struct Target tg;
+_Static_assert(__builtin_offsetof(struct Target, y0) == 014, "struct Target: смещения в limb.s");
+_Static_assert(__builtin_offsetof(struct Actor, cost_stopped) == 0110 &&
+               __builtin_offsetof(struct Actor, cost_curpos) == 0114, "struct Actor: смещения в limb.s");
+static void target_screen(void)
+{
+    tg.base = 040000u + VIEW_ROW * 64;
+    tg.stride = 64;
+    tg.bxlim = 256;
+    tg.ylim = OUT_H;
+    tg.view0 = view0;
+    tg.page = 0;
+    tg.y0 = 0;
+}
+uint8_t measuring;   /* прогон конечностей без рисования: только draw_* */
+static uint8_t prev_keep;   /* актёр рисуется через холст: ячейку prev_* не сбрасывать */
+#ifdef HOST
+#define prev_drop(num)
+#else
+static uint8_t prev_act[4];
+static void prev_drop(uint8_t num)
+{
+    for (uint8_t k = 0; k < 4; k++)
+        if (prev_act[k] == num) prev_act[k] = 0;
+}
+#endif
+int16_t *meas_rec;   /* и прямоугольники конечностей {l, t, r, b} (t 0x7FFF — нет) */
+uint8_t cur_limb;
+
+/* proc3 по колонкам (proc3.s, общая копия кода): параметры — в _bounce
+ * (базовое ОЗУ: proc3 подключает страницу маски и читает её на месте) */
+struct P3
+{
+    const uint8_t *src;     /* 0: RLE (в _band) */
+    uint16_t len, color;    /* 2, 4: незаконченная серия (len 0 — нет) */
+    int16_t vy;             /* 6: верх, точка MM */
+    uint16_t h, skip;       /* 010, 012: высота, колонок */
+    int16_t step, x;        /* 014, 016: шаг колонки (+-1), колонка MM */
+    int16_t xstart;         /* 020 */
+    uint16_t view0;         /* 022 */
+    uint16_t zbuf;          /* 024 */
+    uint16_t mrow0;         /* 026: адрес строки vy маски в PG_MASK */
+    uint16_t mstride;       /* 030: bm_strips */
+    uint8_t cpat[16][4];    /* 032: цвет -> [(y&1)<<1 | (bx&1)] цвет БК */
+    uint16_t drow0;         /* 0132: байт цели строки vy (bx = 0) */
+    uint16_t dstride;       /* 0134: шаг строки цели */
+    uint16_t bxlim, ylim;   /* 0136, 0140: точек БК и строк цели */
+    uint16_t dpage;         /* модель: 0 — видеопамять, иначе страница буфера */
+    uint16_t bmoff;         /* 0144: постройка спрайта — смещение маски от цвета */
+    uint16_t newpal;        /* 0146: cpat построена заново */
+    int16_t shp;            /* 0150: чётность сдвига сетки актёра: узор — по bx ^ shp */
+    int16_t mxoff;          /* 0152: байт фона точки 0 цели (маска — по колонке фона под точкой) */
+};
+#ifndef HOST
+_Static_assert(__builtin_offsetof(struct P3, cpat) == 032 && __builtin_offsetof(struct P3, ylim) == 0140 &&
+               __builtin_offsetof(struct P3, newpal) == 0146 && __builtin_offsetof(struct P3, mxoff) == 0152,
+               "struct P3: смещения в proc3.s");
+#endif
+
+#ifdef HOST
+/* модель proc3.s */
+static void proc3_run(struct P3 *p)
+{
+    int16_t y = p->vy, x = p->x;
+    uint16_t h = p->h, skip = p->skip, len = p->len;
+    uint8_t color = (uint8_t)p->color;
+    const uint8_t *src = p->src;
+    if (len) goto StartPos;
+    for (;;)
+    {
+        len = *src++;
+        color = (uint8_t)(len >> 4);
+        len &= 15;
+        if (!len)
+        {
+            len = *src++;
+            if (!len) len = 256;
+        }
+        do
+        {
+            if (color && (uint16_t)x < OUT_W && (uint16_t)y < p->ylim)
+            {
+                int16_t wx = x + p->xstart;
+                uint16_t bx = BK_X(wx) - p->view0;
+                int16_t mx = (int16_t)(((bx >> 2) + p->mxoff) * 5 + (bx & 3));
+                uint8_t masked = p->zbuf &&
+                    (far_rb(PG_MASK, (uint16_t)(p->mrow0 + (y - p->vy) * p->mstride + mx / 8)) & revBitMask[mx & 7]);
+                if (wx - div5[wx] * 5 != 4 && bx < p->bxlim && !masked)
+                {
+                    uint8_t k = (uint8_t)(bx & 3);
+                    uint8_t c = p->cpat[color][((y & 1) << 1) | ((bx ^ p->shp) & 1)];
+                    uint16_t a = (uint16_t)(p->drow0 + (y - p->vy) * (int16_t)p->dstride + (bx >> 2));
+                    if (p->dpage)
+                        far_wb(p->dpage, a, (uint8_t)((far_rb(p->dpage, a) & ~pix_mask[k]) | pix_val[k][c]));
+                    else
+                        vram[a - 040000] = (uint8_t)((vram[a - 040000] & ~pix_mask[k]) | pix_val[k][c]);
+                }
+            }
+            y++;
+            if (!--h)
+            {
+                if (!--skip) return;
+                h = p->h;
+                y = p->vy;
+                x += p->step;
+                if ((uint16_t)x >= OUT_W) return;
+            }
+        StartPos:;
+        } while (--len);
+    }
+}
+static struct P3 p3;
+#define P3_BUF (&p3)
+#else
+void proc3_run(struct P3 *p);
+#define P3_BUF ((struct P3 *)bounce)
+#endif
+
+/* drawLimb, mainRoutine, cpat_build и поиск в кэше спрайтов — на ассемблере
+ * (limb.s); здесь — их модель (хост; на БК — сборка с -DLIMB_C для сверки) */
+#if defined(HOST) || defined(LIMB_C)
+#define LIMB_IN_C 1
+#endif
+uint16_t cpat_sum;   /* сумма слов P3.cpat (spr_pal) */
+
+/* цвета актёра для proc3: cpal -> узоры палитры комнаты. Строка цели y0 всегда
+ * чётная: чётность строки от её верха — та же, что на экране */
+#ifdef LIMB_IN_C
+static void cpat_build(void)
+{
+    struct P3 *p = P3_BUF;
+    for (uint8_t c = 0; c < 16; c++)
+    {
+        const uint8_t *q = APAT(cpal[c] & 15);
+        uint8_t *o = p->cpat[c];
+        o[0] = q[0];
+        o[1] = q[1];
+        o[2] = q[2];
+        o[3] = q[3];
+    }
+    p->newpal = 1;
+    const uint16_t *c = (const uint16_t *)p->cpat;
+    uint16_t sum = 0;
+    for (uint8_t i = 0; i < 32; i++) sum = (uint16_t)(((sum << 1) | (sum >> 15)) + c[i]);
+    cpat_sum = sum;
+}
+#else
+void cpat_build(void);
+#endif
+
+static uint16_t p3_bmoff;   /* постройка спрайта (spr_draw) */
+
+/* proc3: v_x — колонка экрана MM, v_y — верх, skip_width — колонок;
+ * len0/color0 — незаконченная серия после codec1_ignorePakCols (вход в StartPos) */
+static void proc3(int16_t v_x, int16_t v_y, int16_t skip_width, int8_t step, const uint8_t *src,
+                  uint8_t len0, uint8_t color0)
+{
+    struct P3 *p = P3_BUF;
+    p->src = src;
+    p->len = len0;
+    p->color = color0;
+    p->vy = v_y - tg.y0;
+    p->h = (uint16_t)height;
+    p->skip = (uint16_t)skip_width;
+    p->step = step;
+    p->x = v_x;
+    p->xstart = xstart - v_D;   /* колонка в сетке актёра */
+    /* постройка спрайта — в сетке актёра; иначе — точки цели */
+    p->view0 = p3_bmoff ? tg.view0 : (uint16_t)(tg.view0 - v_sh);
+    p->shp = p3_bmoff ? 0 : v_sh & 1;
+    p->mxoff = (int16_t)(tg.view0 >> 2);
+    int16_t dy = v_y - tg.y0;
+    p->drow0 = (uint16_t)(tg.base + (tg.stride == 64 ? dy << 6 : dy * (int16_t)tg.stride));
+    p->dstride = tg.stride;
+    p->bxlim = tg.bxlim;
+    p->ylim = tg.ylim;
+    p->dpage = tg.page;
+    p->zbuf = zbuf;
+    p->mrow0 = zbuf ? (uint16_t)(PAGE_ADDR + v_y * (int16_t)bm_strips) : 0;
+    p->mstride = bm_strips;
+    p->bmoff = p3_bmoff;
+    /* cpat — на актёра (cpat_build): _bounce между конечностями никто не трогает */
+    proc3_run(p);
+}
+
+/* base-costume.cpp: codec1_ignorePakCols — пропуск num колонок RLE */
+static const uint8_t *ignorePakCols(const uint8_t *src, int16_t num, uint8_t *replen, uint8_t *repcolor)
+{
+    int32_t n = (int32_t)num * height;
+    for (;;)
+    {
+        *replen = *src++;
+        *repcolor = *replen >> 4;
+        *replen &= 15;
+        if (!*replen) *replen = *src++;
+        do
+        {
+            if (!--n) return src;
+        } while (--*replen);
+    }
+}
+
+#ifndef HOST
+/* длина RLE кадров, нарисованных целиком (по концу чтения в proc3): в _band
+ * копируется она, а не оценка width * height. Таблица — в странице кэша спрайтов,
+ * пока она подключена (lh_on) */
+#define RL_N 64
+struct RlEnt { uint16_t addr, len; uint8_t page, pad; };
+#define SPR_RL 051500u
+#define RL_AT(i) ((struct RlEnt *)(SPR_RL + MUL3((uint16_t)(i) << 1)))
+#define RL_SLOT(pg, a) ((uint8_t)(((a) ^ (a) >> 6 ^ (pg)) & (RL_N - 1)))
+static uint8_t rl_s;
+uint8_t lh_on;
+#endif
+static uint16_t rl_n;
+
+/* RLE кадра (srcptr) -> _band (ScummVM читает его на месте); байт RLE — не
+ * меньше точки: кадр не длиннее width * height */
+static void rle_read(void)
+{
+    uint16_t n;
+#ifndef HOST
+    rl_s = RL_SLOT(c_page, srcptr);
+    struct RlEnt *r = RL_AT(rl_s);
+    if (lh_on && r->addr == srcptr && r->page == c_page)
+        n = r->len;
+    else
+#endif
+    {
+        n = sizeof band;
+        if ((uint16_t)width < 256 && (uint16_t)height < 256 && (uint16_t)width * (uint16_t)height + 2 < n)
+            n = (uint16_t)width * (uint16_t)height + 2;
+        if ((uint32_t)srcptr + n > PAGE_ADDR + PAGE_DATA_SIZE) n = (uint16_t)(PAGE_ADDR + PAGE_DATA_SIZE - srcptr);
+    }
+    rl_n = n;
+    far_rd(band, c_page, srcptr, n);
+}
+
+/* после proc3 по кадру целиком: длина RLE — до конца прочитанного */
+static void rle_used(void)
+{
+#ifndef HOST
+    uint16_t used = (uint16_t)(P3_BUF->src - band);
+    if (lh_on && used <= rl_n)
+    {
+        struct RlEnt *r = RL_AT(rl_s);
+        r->addr = srcptr;
+        r->page = c_page;
+        r->len = used;
+    }
+#endif
+}
+
+#ifndef HOST
+/* Кэш спрайтов — страница 2 ОЗУ 11М в окне 040000 (подключается на время
+ * рисования актёра в холст). Спрайт — конечность, видимая целиком: плоскости
+ * цвета и маски (байты БК, h строк по w + 1, первый — ноль), строит proc3 (режим
+ * постройки). Ключ: костюм и его место в куче (вытесненный и прочитанный заново —
+ * промах), кадр, зеркало, фаза сжатия 4:5 и точка в байте (в сетке актёра — от
+ * места не зависят), чётность строки,
+ * цвета (слот палитры). Память — кольцо кругами lap: спрайт годен, если построен
+ * на этом круге или на прошлом за вершиной. После запуска страница — в нулях */
+#define SPR_PG 2
+#define SPR_SLOTS 64
+#define SPR_WIN 8
+#define SPR_NPAL 8
+#define SPR_BUILDS 4            /* построений за шаг */
+struct SprHdr { uint16_t top; uint8_t lap, rr, prr, pad[11]; };
+struct SprPal { uint16_t sum; uint8_t cpat[64]; };
+struct SprSlot { uint16_t res, foff, off, ps; uint8_t pg, cost, key, pal, w, h, lap, pad; };
+_Static_assert(sizeof(struct SprSlot) == 16, "SprSlot: 16 байт");
+#define SPR_HDR ((struct SprHdr *)040000)
+#define SPR_PAL ((struct SprPal *)040020)
+#define SPR_SLOT ((struct SprSlot *)041100)
+#define SPR_REC 043100u        /* 2 x 16 x {l, t, r, b}: прогоны draw_via_canvas */
+#define SPR_LH 043500u         /* заголовки кадров конечностей (drawLimb) */
+#define SPR_PREV 052300u       /* 4 x 16 x {l, t, r, b}: конечности последнего кадра (prev_*) */
+#define SPR_RING 053300u
+#define LH_N 128
+struct LimbHdr { uint16_t res, pos, foff; int16_t hdr[6]; uint8_t pg, cost, limb, skip, pad[2]; };
+_Static_assert(sizeof(struct LimbHdr) == 24 && SPR_LH + LH_N * 24u == SPR_RL && sizeof(struct RlEnt) == 6 &&
+               SPR_RL + RL_N * 6u == SPR_PREV && SPR_PREV + 4 * 0200u == SPR_RING, "LimbHdr, RlEnt: место в странице 2");
+#define LH_AT(i) ((struct LimbHdr *)(SPR_LH + MUL3((uint16_t)(i) << 3)))
+#define SPR_END 0100000u
+void spr_blit(uint16_t src, uint16_t msk, uint16_t w, uint16_t h, uint16_t dst, uint16_t dskip, uint16_t sskip);
+void spr_blits(uint16_t src, uint16_t ps, uint16_t w1, uint16_t h, uint16_t dst, uint16_t dskip, uint16_t s);
+void spr_blitm(uint16_t src, uint16_t ps, uint16_t w1, uint16_t nb, uint16_t h, uint16_t dst, uint16_t dskip,
+               uint16_t s, uint16_t mrow, uint16_t cbit, uint16_t mstride);
+
+uint8_t spr_can, spr_pl;
+static uint8_t spr_budget;
+static uint16_t spr_m11;
+
+static void spr_on(void)
+{
+    spr_m11 = mem11;
+    w1_map(SPR_PG);
+    lh_on = 1;
+}
+
+static void spr_off(void)
+{
+    lh_on = 0;
+    mem11 = spr_m11;   /* тень — первой: кадровое прерывание возвращает окно по ней */
+    *(volatile uint16_t *)0177716 = spr_m11;
+}
+
+/* длины RLE кадров — по месту в куче: после вытеснения костюмов (cost_evicted) негодны */
+void rl_forget(void)
+{
+    uint8_t on = lh_on;
+    if (!on) spr_on();
+    for (uint8_t i = 0; i < RL_N; i++) RL_AT(i)->page = 0;
+    if (!on) spr_off();
+}
+
+/* слот палитры с цветами P3.cpat; новый — вместо старейшего, его спрайты негодны */
+static uint8_t spr_pal(void)
+{
+    const uint16_t *c = (const uint16_t *)P3_BUF->cpat;
+    uint16_t sum = cpat_sum;
+    struct SprPal *pp = SPR_PAL;
+    for (uint8_t k = 0; k < SPR_NPAL; k++, pp++)
+        if (pp->sum == sum)
+        {
+            const uint16_t *q = (const uint16_t *)pp->cpat, *cc = c;
+            uint8_t i = 32;
+            while (i && *q == *cc) i--, q++, cc++;
+            if (!i) return k;
+        }
+    uint8_t k = SPR_HDR->prr;
+    SPR_HDR->prr = (uint8_t)((k + 1) & (SPR_NPAL - 1));
+    pp = &SPR_PAL[k];
+    pp->sum = sum;
+    uint16_t *q = (uint16_t *)pp->cpat;
+    for (uint8_t i = 0; i < 32; i++) q[i] = c[i];
+    for (uint8_t j = 0; j < SPR_SLOTS; j++)
+        if (SPR_SLOT[j].pal == k) SPR_SLOT[j].h = 0;
+    return k;
+}
+
+/* постройка спрайта конечности в кэше (fr — негодный слот из окна поиска или 0;
+ * b0, w, key, h — как в spr_draw); 0 — не построен (рисовать proc3) */
+struct SprSlot *spr_build(int16_t vx, int16_t vy, int8_t step, uint16_t b0, uint8_t w, uint8_t key, uint8_t h,
+                          struct SprSlot *fr)
+{
+    uint16_t foff = srcptr - c_res;
+    uint8_t w1 = (uint8_t)(w + 1);
+    struct SprSlot *sl;
+    uint16_t ps = ((uint16_t)w1 * (uint16_t)height + 2) & ~1u;   /* плоскость: и ноль за ней, чётная */
+    if (!spr_budget || ps > (SPR_END - SPR_RING) / 2) return 0;
+    spr_budget--;
+    if (!fr)
+    {
+        fr = &SPR_SLOT[(uint8_t)(h + SPR_HDR->rr) & (SPR_SLOTS - 1)];
+        SPR_HDR->rr = (uint8_t)((SPR_HDR->rr + 1) & (SPR_WIN - 1));
+    }
+    sl = fr;
+    if (SPR_HDR->top < SPR_RING || SPR_HDR->top + 2 * ps > SPR_END)
+    {
+        SPR_HDR->top = SPR_RING;
+        if (!++SPR_HDR->lap)   /* слоты 256 кругов назад сочлись бы годными */
+        {
+            for (uint8_t j = 0; j < SPR_SLOTS; j++) SPR_SLOT[j].h = 0;
+            SPR_HDR->lap = 1;
+        }
+    }
+    sl->off = SPR_HDR->top;
+    SPR_HDR->top += 2 * ps;
+    for (uint16_t *z = (uint16_t *)sl->off, n = ps; n; n--) *z++ = 0;
+    rle_read();
+    struct Target sv = tg;
+    tg.base = sl->off + 1 - (vy & 1 ? w1 : 0);
+    tg.stride = w1;
+    tg.bxlim = (uint16_t)w * 4;
+    tg.ylim = (uint16_t)height + (vy & 1);
+    tg.view0 = b0 & ~3u;
+    tg.y0 = vy & ~1;
+    p3_bmoff = ps;
+    proc3(vx, vy, width, step, band, 0, 0);
+    p3_bmoff = 0;
+    tg = sv;
+    rle_used();
+    sl->res = c_res;
+    sl->foff = foff;
+    sl->ps = ps;
+    sl->pg = c_page;
+    sl->cost = c_cost;
+    sl->key = key;
+    sl->pal = spr_pl;
+    sl->w = w;
+    sl->h = (uint8_t)height;
+    sl->lap = SPR_HDR->lap;
+    return sl;
+}
+
+#ifdef LIMB_IN_C
+static uint8_t spr_valid(const struct SprSlot *q)
+{
+    return q->h && (q->lap == SPR_HDR->lap || ((uint8_t)(q->lap + 1) == SPR_HDR->lap && q->off >= SPR_HDR->top));
+}
+
+/* конечность (видна целиком по x) в холст из кэша, строки — с
+ * обрезкой по холсту; 0 — рисовать proc3. vx — первая колонка proc3, step — её шаг.
+ * Спрайт — в сетке актёра от байта V (строки по w + 1 байт: впереди ноль), в холсте —
+ * с точки V + v_sh: сдвиг на v_sh & 3 точек — при выводе */
+uint8_t spr_draw(int16_t vx, int16_t vy, int8_t step)
+{
+    if ((uint16_t)width > 254 || (uint16_t)height > 255) return 0;
+    int16_t wv = (step > 0 ? vx : vx - width + 1) + xstart - v_D;   /* левая колонка в сетке */
+    uint16_t b0 = BK_X(wv), b1 = BK_X(wv + width - 1);
+    uint8_t w = (uint8_t)(((b0 & 3) + (b1 - b0) + 4) >> 2);
+    int16_t vb = (int16_t)(b0 & ~3u) + v_sh - (int16_t)tg.view0;   /* точка холста байта V */
+    if (vb < 0) return 0;
+    uint8_t sh = (uint8_t)(vb & 3);
+    uint16_t col = (uint16_t)vb >> 2;
+    if (col + w + (sh != 0) > tg.bxlim >> 2) return 0;
+    uint8_t key = (uint8_t)((wv - MUL5(div5[wv])) | (b0 & 3) << 3 | (vy & 1) << 5 | mirror << 6);
+    uint16_t foff = srcptr - c_res;
+    uint8_t h = (uint8_t)(foff ^ (foff >> 5) ^ c_cost ^ (key << 2) ^ (spr_pl << 5));
+    struct SprSlot *sl = 0, *fr = 0;
+    for (uint8_t k = 0; k < SPR_WIN; k++)
+    {
+        struct SprSlot *q = &SPR_SLOT[(uint8_t)(h + k) & (SPR_SLOTS - 1)];
+        if (!spr_valid(q))
+        {
+            if (!fr) fr = q;
+        }
+        else if (q->foff == foff && q->key == key && q->res == c_res && q->pg == c_page && q->cost == c_cost &&
+                 q->pal == spr_pl)
+        {
+            sl = q;
+            break;
+        }
+    }
+    uint8_t w1 = (uint8_t)(w + 1);
+    if (!sl && !(sl = spr_build(vx, vy, step, b0, w, key, h, fr))) return 0;
+    int16_t r0 = tg.y0 - vy, r1 = tg.y0 + (int16_t)tg.ylim - vy;   /* строки спрайта в холсте */
+    if (r0 < 0) r0 = 0;
+    if (r1 > height) r1 = height;
+    if (r1 <= r0) return 1;
+    uint16_t src = sl->off + 1 + (r0 ? (uint16_t)r0 * w1 : 0);   /* обычно спрайт в холсте целиком */
+    uint16_t dst = tg.base + (uint16_t)(vy + r0 - tg.y0) * tg.stride + col;
+    if (zbuf)   /* маска глубины — по колонкам фона под точками */
+    {
+        uint8_t nb = sh ? w1 : w;
+        spr_blitm(src, sl->ps, w1, nb, (uint16_t)(r1 - r0), dst, tg.stride - nb, sh,
+                  PAGE_ADDR + (uint16_t)(vy + r0) * bm_strips, MUL5((tg.view0 >> 2) + col), bm_strips);
+    }
+    else if (!sh)
+        spr_blit(src, src + sl->ps, w, (uint16_t)(r1 - r0), dst, tg.stride - w, 1);
+    else
+        spr_blits(src, sl->ps, w1, (uint16_t)(r1 - r0), dst, tg.stride - w1, sh);
+    return 1;
+}
+#endif
+#endif
+
+/* конечность через proc3 (mainRoutine после обрезки; pre — колонок пропустить) */
+void limb_p3(int16_t vx, int16_t vy, int16_t skip_width, int8_t step, int16_t pre, uint8_t drawFlag)
+{
+    rle_read();
+    const uint8_t *src = band;
+    uint8_t replen = 0, repcolor = 0;
+    if (pre) src = ignorePakCols(src, pre, &replen, &repcolor);
+    proc3(vx, vy, skip_width, step, src, replen, repcolor);
+    if (drawFlag == 2) rle_used();
+}
+
+/* заголовок кадра конечности (width, height, смещения x/y кадра, сдвиг x/y) —
+ * дальними чтениями, с записью в кэш e (если не 0); 0 — конечность пропускается */
+struct LimbHdr;
+int16_t *limb_hdr(uint8_t limb, uint16_t i, struct LimbHdr *e)
+{
+    static int16_t hdr[6];
+    int16_t t[6];   /* far_rd — в базовое ОЗУ: окно банка занято страницей костюма */
+    uint16_t frameptr = c_res + far_rw(c_page, c_frameOffsets + limb * 2);
+    uint8_t code = far_rb(c_page, c_animCmds + i) & 0x7F;
+#ifndef HOST
+    if (e)
+    {
+        e->pos = i;
+        e->limb = limb;
+        e->cost = c_cost;
+        e->res = c_res;
+        e->pg = c_page;
+        e->skip = code == 0x7B;
+    }
+#endif
+    if (code == 0x7B) return 0;
+    srcptr = c_res + far_rw(c_page, frameptr + code * 2);
+    far_rd(t, c_page, srcptr, sizeof t);
+    for (uint8_t k = 0; k < 6; k++) hdr[k] = t[k];
+#ifndef HOST
+    if (e)
+    {
+        e->foff = srcptr - c_res;
+        for (uint8_t k = 0; k < 6; k++) e->hdr[k] = t[k];
+    }
+#endif
+    return hdr;
+}
+
+#ifdef LIMB_IN_C
+/* costume.cpp: ClassicCostumeRenderer::mainRoutine (без масштабирования) */
+static uint8_t mainRoutine(int16_t xmoveCur, int16_t ymoveCur)
+{
+    int16_t vx = actorX, vy = actorY, skip = 0, pre = 0;
+    uint8_t drawFlag = 1;
+    if (!mirror) xmoveCur = -xmoveCur;
+    vx += xmoveCur;
+    vy += ymoveCur;
+    int16_t l, r, t, b;
+    if (mirror)
+    {
+        l = vx;
+        r = vx + width;
+    }
+    else
+    {
+        l = vx - width;
+        r = vx;
+    }
+    t = vy;
+    b = t + height;
+    /* markRectAsDirty: полосы, занятые актёром */
+    if (t >= OUT_H || b <= 0) return 0;
+    if (l >= OUT_W || r <= 0) return 0;
+    int16_t skip_width = width;
+    int8_t step = mirror ? 1 : -1;
+    if (mirror)
+    {
+        skip = -vx;
+        if (skip > 0)
+        {
+            skip_width -= skip;
+            pre = skip;   /* codec1_ignorePakCols */
+            vx = 0;
+        }
+        else
+        {
+            skip = r - OUT_W;
+            if (skip <= 0) drawFlag = 2;
+            else skip_width -= skip;
+        }
+    }
+    else
+    {
+        skip = r - OUT_W;
+        if (skip > 0)
+        {
+            skip_width -= skip;
+            pre = skip;
+            vx = OUT_W - 1;
+        }
+        else
+        {
+            skip = -1 - l;
+            if (skip <= 0) drawFlag = 2;
+            else skip_width -= skip;
+        }
+    }
+    if (skip_width <= 0) return 0;
+    if (l < 0) l = 0;
+    if (t < 0) t = 0;
+    if (b > OUT_H) b = OUT_H;
+    if (draw_top > t) draw_top = t;
+    if (draw_bottom < b) draw_bottom = b;
+    if (draw_left > l) draw_left = l;
+    if (draw_right < r + 1) draw_right = r + 1;
+    if (meas_rec)
+    {
+        int16_t *q = meas_rec + cur_limb * 4;
+        q[0] = l;
+        q[1] = t;
+        q[2] = r;
+        q[3] = b;
+    }
+    if (height + t >= 256) return 2;
+    if (measuring) return drawFlag;
+    if (vy >= tg.y0 + (int16_t)tg.ylim || vy + height <= tg.y0) return drawFlag;   /* вне строк цели */
+#ifndef HOST
+    if (spr_can && drawFlag == 2 && spr_draw(vx, vy, step)) return drawFlag;
+#endif
+    limb_p3(vx, vy, skip_width, step, pre, drawFlag);
+    return drawFlag;
+}
+
+/* costume.cpp: ClassicCostumeRenderer::drawLimb */
+static uint8_t drawLimb(struct Actor *a, uint8_t limb)
+{
+    if (a->cost_curpos[limb] == 0xFFFF || (a->cost_stopped & (1u << limb))) return 0;
+    uint16_t i = a->cost_curpos[limb] & 0x7FFF;
+    const int16_t *hdr;
+    struct LimbHdr *e = 0;
+#ifndef HOST
+    /* заголовок кадра — из кэша (страница 2 подключена): без дальних чтений */
+    if (lh_on)
+    {
+        e = LH_AT((uint8_t)(i ^ (i >> 5) ^ (limb << 3) ^ c_cost) & (LH_N - 1));
+        if (e->pos == i && e->limb == limb && e->cost == c_cost && e->res == c_res && e->pg == c_page)
+        {
+            if (e->skip) return 0;
+            srcptr = c_res + e->foff;
+            hdr = e->hdr;
+            goto have;
+        }
+    }
+#endif
+    hdr = limb_hdr(limb, i, e);
+    if (!hdr) return 0;
+#ifndef HOST
+have:
+#endif
+    width = hdr[0];
+    height = hdr[1];
+    int16_t xmoveCur = xmove + hdr[2];
+    int16_t ymoveCur = ymove + hdr[3];
+    xmove += hdr[4];
+    ymove -= hdr[5];
+    srcptr += 12;
+    cur_limb = limb;
+    return mainRoutine(xmoveCur, ymoveCur);
+}
+#else
+uint8_t limbs_draw(struct Actor *a);
+#endif
+
+/* цвета актёра для сверки с прошлой отрисовкой (dr_pal) */
+static const struct Actor *pal_a;   /* act_pal: последний актёр (сбрасывается в шаге) */
+static uint16_t pal_v;
+static uint16_t act_pal(const struct Actor *a)
+{
+    if (pal_a == a) return pal_v;
+    uint16_t s = (uint16_t)((VAR(VAR_CURRENT_LIGHTS) & 8) | (uint16_t)pal_cur << 4);
+    const uint16_t *p = (const uint16_t *)a->palette;
+    for (uint8_t i = 8; i; i--) s = (uint16_t)(((s << 1) | (s >> 15)) + *p++);
+    pal_a = a;
+    return pal_v = s;
+}
+
+/* room.c getMaskFromBox без дальнего вызова: боксы — в базовом ОЗУ */
+static uint8_t box_mask(uint8_t box)
+{
+#ifdef HOST
+    return getMaskFromBox(box);
+#else
+    extern uint8_t boxes[BOXES_SIZE];
+    if (box == 255) return 1;
+    if (boxes[0] == box) box--;
+    if (box >= boxes[0]) return getMaskFromBox(box);   /* там — fatal */
+    return boxes[(uint16_t)box * 8 + 7];
+#endif
+}
+
+/* actor.cpp: Actor::drawActorCostume + prepareDrawActorCostume (v2) */
+static void drawActorCostume(struct Actor *a)
+{
+    if (a->costume == 0) return;
+    if (!a->needRedraw) return;
+    a->needRedraw = 0;
+    if (!loadCostume(a->costume)) return;
+    actorX = (int16_t)(a->x * V12_X_MULTIPLIER);
+    actorY = (int16_t)((a->y - a->elevation) * V12_Y_MULTIPLIER);
+    actorX -= xstart;
+    if (a->facing == 270) actorX += 16;
+    else actorX += 8;
+    /* сетка актёра: v_D = (x мира якоря mod 20) - 20 — колонки сетки не меньше 4 */
+    int16_t aw = actorX + xstart;
+    uint8_t am = 0;
+    if (aw >= 0 && aw < 1024)
+    {
+        uint8_t q = div5[aw];
+        am = (uint8_t)(aw - MUL5(q) + MUL5(q & 3));
+    }
+    v_D = (int16_t)am - 20;
+    v_sh = (int16_t)BK_X(am) - 16;
+    /* ClassicCostumeRenderer::setPalette (GF_OLD_BUNDLE): без LIGHTMODE_actor_use_colors
+     * (темно) — силуэт: все цвета 8, цвет 12 — чёрный */
+    {
+        uint16_t *cp = (uint16_t *)cpal;
+        const uint16_t *pp = (const uint16_t *)a->palette;
+        uint8_t lit = VAR(VAR_CURRENT_LIGHTS) & 8;
+        for (uint8_t i = 8; i; i--) *cp++ = lit ? *pp++ : 0x0808;
+        if (!lit) cpal[12] = 0;
+    }
+    cpal[c_palette0 & 15] = cpal[0];
+    /* setFacing */
+    int16_t f = a->facing;
+    uint8_t d = 3;
+    if (f >= 71 && f <= 109) d = 1;
+    else if (f >= 109 && f <= 251) d = 2;
+    else if (f >= 251 && f <= 289) d = 0;
+    uint8_t fmt = c_fmt;
+    mirror = d != 0 || (fmt & 0x80);
+    /* _zbuf: маска из бокса (v3 и ниже — не больше 1); прогону без рисования не нужна */
+    zbuf = measuring ? 0 : box_mask(a->walkbox);
+    if (zbuf > 1) zbuf = 1;
+    draw_top = draw_left = 0x7FFF;
+    draw_bottom = draw_right = -0x7FFF;
+    xmove = -72;
+    ymove = -100;
+    if (!measuring) cpat_build();
+#ifndef HOST
+    if (!measuring && tg.page)   /* в холст: кэш спрайтов */
+    {
+        spr_on();
+        spr_can = 1;
+        spr_pl = spr_pal();
+    }
+#endif
+    uint8_t result = 0;
+#ifdef LIMB_IN_C
+    for (uint8_t i = 0; i < 16; i++) result |= drawLimb(a, i);
+#else
+    result = limbs_draw(a);
+#endif
+#ifndef HOST
+    if (spr_can)
+    {
+        spr_can = 0;
+        spr_off();
+    }
+#endif
+    if (result & 1) a->needRedraw = 1;   /* _needRedraw = (version <= 6) */
+    a->top = draw_top;
+    a->bottom = draw_bottom;
+    if (!measuring)
+    {
+        if (prev_keep != a->number) prev_drop(a->number);   /* нарисован не через холст */
+        uint16_t *dp = a->dr_pos;
+        const uint16_t *cp = a->cost_curpos;
+        for (uint8_t i = 16; i; i--) *dp++ = *cp++;
+        a->dr_stopped = a->cost_stopped;
+        a->dr_pal = act_pal(a);
+        pal_a = 0;
+        a->dr_x = a->x;
+        a->dr_y = a->y - a->elevation;
+        a->dr_facing = a->facing;
+        a->dr_xs = xstart;
+        a->dr_cost = a->costume;
+    }
+}
+
+/* gfxUsageBits для getActorFromPos */
+uint8_t actor_in_strip(int16_t strip, uint8_t act)
+{
+    int16_t s = strip - (xstart >> 3);
+    if (s < 0 || s >= 41) return 0;
+    return (strip_usage[s][act >> 3] >> (act & 7)) & 1;
+}
+
+/* восстановить фон экрана в прямоугольнике точек MM (x: 0..319, y: 0..127) */
+/* прямоугольник точек MM -> колонки БК [c0, c1) экрана и строки [t, b); 0 — пусто */
+static uint8_t rect_cols(int16_t l, int16_t *t, int16_t r, int16_t *b, uint16_t *c0, uint16_t *c1)
+{
+    if (l < 0) l = 0;
+    if (r > OUT_W) r = OUT_W;
+    if (*t < 0) *t = 0;
+    if (*b > OUT_H) *b = OUT_H;
+    if (l >= r || *t >= *b) return 0;
+    *c0 = (uint16_t)((bk_x(l + xstart) - view0) >> 2);
+    *c1 = (uint16_t)((bk_x(r - 1 + xstart) + 1 - view0) >> 2) + 1;   /* сетка актёра — до точки правее */
+    if (*c1 > 64) *c1 = 64;
+    uint16_t vcol = view0 >> 2;
+    if (vcol + *c1 > bm_stride) *c1 = bm_stride - vcol;
+    return *c0 < *c1;
+}
+
+static void restoreRect(int16_t l, int16_t t, int16_t r, int16_t b)
+{
+    uint16_t c0, c1;
+    cursor_hide_view(l, t, r, b);
+    if (!rect_cols(l, &t, r, &b, &c0, &c1)) return;
+    if (lt_mode)   /* темно: фон — чёрный, у фонарика — из фона (gfx.c) */
+    {
+        bg_vram(view0 >> 2, (uint16_t)t, (uint16_t)(b - t), c0, c1);
+        return;
+    }
+    bm_blit(PAGE_ADDR + (uint16_t)t * bm_stride + (view0 >> 2) + c0, bm_stride,
+            040000u + (uint16_t)(VIEW_ROW + t) * 64 + c0, c1 - c0, (uint16_t)(b - t));
+}
+
+/* Холст — внеэкранный буфер (PG_MASK, CANVAS): окно экрана -> буфер, фон под
+ * прежними кадрами, новые кадры, буфер -> экран одной записью: без мерцания.
+ * Строки — с чётным шагом cv_ns от cv_base той же чётности, что колонка экрана
+ * (копии словами); верх окна — чётная строка (cpat_build) */
+#define CANVAS 0152000u
+#define CANVAS_SIZE 05400u
+void cv_load(uint16_t cv, uint16_t vram_addr, uint16_t ncols, uint16_t nrows, uint16_t pad);
+void cv_store(uint16_t cv, uint16_t vram_addr, uint16_t ncols, uint16_t nrows, uint16_t pad);
+void cv_bg(uint16_t cv, uint16_t cvstride, uint16_t bm, uint16_t bmstride, uint16_t ncols, uint16_t nrows);
+
+static uint16_t cv_nc, cv_ns, cv_base, cv_c0, cv_rows, cv_scr;
+static int16_t cv_t;
+
+/* окно [l, r) x [t, b) точек MM -> холст, цель — он; 0 — не помещается */
+static uint8_t cv_open(int16_t l, int16_t t, int16_t r, int16_t b)
+{
+    uint16_t c0, c1;
+    if (t & 1) t--;
+    if (!rect_cols(l, &t, r, &b, &c0, &c1)) return 0;
+    uint16_t nc = c1 - c0, nrows = (uint16_t)(b - t), ns = (nc + 1) & ~1u;
+    if ((uint16_t)(nrows * ns) >= CANVAS_SIZE) return 0;   /* и байт выравнивания cv_base */
+    cv_nc = nc;
+    cv_ns = ns;
+    cv_base = CANVAS + (c0 & 1);
+    cv_c0 = c0;
+    cv_rows = nrows;
+    cv_t = t;
+    cv_scr = 040000u + (uint16_t)(VIEW_ROW + t) * 64 + c0;
+    cursor_hide_view(l, t, r, b);   /* в холст он попал бы с экрана */
+    cv_load(cv_base, cv_scr, nc, nrows, ns - nc);
+    tg.base = cv_base;
+    tg.stride = ns;
+    tg.bxlim = nc * 4;
+    tg.ylim = nrows;
+    tg.view0 = view0 + c0 * 4;
+    tg.page = PG_MASK;
+    tg.y0 = t;
+    return 1;
+}
+
+/* фон под прямоугольником o (в пределах окна) — в холст */
+static void cv_bgrect(const struct DrawnRect *o)
+{
+    int16_t ot = o->t < cv_t ? cv_t : o->t, ob = o->b > cv_t + (int16_t)cv_rows ? cv_t + (int16_t)cv_rows : o->b;
+    uint16_t oc0, oc1;
+    if (!rect_cols(o->l, &ot, o->r, &ob, &oc0, &oc1)) return;
+    if (oc0 < cv_c0) oc0 = cv_c0;
+    if (oc1 > cv_c0 + cv_nc) oc1 = cv_c0 + cv_nc;
+    if (oc0 >= oc1) return;
+    cv_bg(cv_base + (uint16_t)(ot - cv_t) * cv_ns + (oc0 - cv_c0), cv_ns,
+          PAGE_ADDR + (uint16_t)ot * bm_stride + (view0 >> 2) + oc0, bm_stride, oc1 - oc0, (uint16_t)(ob - ot));
+}
+
+static void cv_close(void)
+{
+    target_screen();
+    cv_store(cv_base, cv_scr, cv_nc, cv_rows, cv_ns - cv_nc);
+}
+
+static void rect_union(struct DrawnRect *u, const struct DrawnRect *q)
+{
+    if (q->r <= q->l || q->b <= q->t) return;
+    if (q->l < u->l) u->l = q->l;
+    if (q->r > u->r) u->r = q->r;
+    if (q->t < u->t) u->t = q->t;
+    if (q->b > u->b) u->b = q->b;
+}
+
+/* прямоугольник нового кадра (прогон без рисования) */
+static void measure(struct Actor *a, struct DrawnRect *n)
+{
+    uint8_t nr = a->needRedraw;
+    int16_t tp = a->top, bt = a->bottom;
+    measuring = 1;
+    a->needRedraw = 1;
+    drawActorCostume(a);
+    measuring = 0;
+    a->needRedraw = nr;
+    n->l = draw_left;
+    n->r = draw_right;
+    n->t = a->top;
+    n->b = a->bottom;
+    a->top = tp;
+    a->bottom = bt;
+}
+
+#ifdef HOST
+static int16_t rec_buf[2][64];
+#define REC(p) (rec_buf[p])
+#define spr_on()
+#define spr_off()
+#else
+/* REC(0) — буфер прогона: после отрисовки меняется местами с ячейкой актёра (prev_store) */
+static uint16_t rec0 = SPR_REC;
+#define REC(p) ((int16_t *)((p) ? SPR_REC + 0200u : rec0))
+#endif
+
+static void rec_clear(int16_t *q)
+{
+    for (uint8_t i = 0; i < 16; i++, q += 4) q[1] = 0x7FFF;
+}
+
+/* Прямоугольники конечностей кадра, нарисованного через холст последним (его
+ * состояние — dr_*): у актёра на месте прогон по прежнему кадру (measure) не нужен.
+ * 4 ячейки в странице кэша спрайтов; актёр, нарисованный иначе, — без ячейки */
+#ifdef HOST
+#define prev_find(num) ((int16_t *)0)
+#define prev_store(num)
+#else
+static uint8_t prev_rr;
+static uint16_t prev_buf[4] = { SPR_PREV, SPR_PREV + 0200u, SPR_PREV + 0400u, SPR_PREV + 0600u };
+
+static int16_t *prev_find(uint8_t num)
+{
+    for (uint8_t k = 0; k < 4; k++)
+        if (prev_act[k] == num) return (int16_t *)prev_buf[k];
+    return 0;
+}
+
+/* REC(0) — в ячейку актёра: обмен буферами */
+static void prev_store(uint8_t num)
+{
+    uint8_t k = 0;
+    while (k < 4 && prev_act[k] != num) k++;
+    if (k == 4)
+    {
+        k = prev_rr;
+        prev_rr = (uint8_t)((k + 1) & 3);
+        prev_act[k] = num;
+    }
+    uint16_t t = prev_buf[k];
+    prev_buf[k] = rec0;
+    rec0 = t;
+}
+#endif
+
+/* актёр в своём окне (новый кадр и прежний o, если есть: фон под ним); 0 — окно
+ * не помещается (рисовать на экране). part — на экране его прежний кадр (dr_*) на
+ * целом фоне: если актёр на месте, окно — строки сменившихся конечностей (и
+ * сдвинутых ими) в прежнем и новом кадре */
+static uint8_t draw_via_canvas(struct Actor *a, const struct DrawnRect *o, uint8_t part)
+{
+    uint8_t same = part && o->r > o->l && a->dr_cost == a->costume && a->dr_x == a->x &&
+                   a->dr_y == a->y - a->elevation && a->dr_facing == a->facing && a->dr_xs == xstart &&
+                   a->dr_pal == act_pal(a);
+    if (same)
+    {
+        uint8_t m = a->cost_stopped != a->dr_stopped;
+        if (!m)
+        {
+            const uint16_t *cp = a->cost_curpos, *dp = a->dr_pos;
+            for (uint8_t i = 16; i; i--)
+                if (*cp++ != *dp++)
+                {
+                    m = 1;
+                    break;
+                }
+        }
+        if (!m)   /* на экране всё как есть */
+        {
+            a->needRedraw = 0;
+            draw_left = o->l;
+            draw_right = o->r;
+            return 1;
+        }
+    }
+    struct DrawnRect w, w1;
+    int16_t bt0 = 0x7FFF, bb0 = -1;
+    spr_on();   /* записи прогонов — в странице кэша */
+    meas_rec = REC(0);
+    rec_clear(meas_rec);
+    measure(a, &w);
+    const int16_t *q = same ? prev_find(a->number) : 0;   /* прежний кадр — запомнен */
+    if (same && !q)   /* прогон по прежнему кадру: обмен с dr_pos туда и обратно */
+    {
+        meas_rec = REC(1);
+        rec_clear(meas_rec);
+        for (uint8_t i = 0; i < 16; i++)
+        {
+            uint16_t v = a->cost_curpos[i];
+            a->cost_curpos[i] = a->dr_pos[i];
+            a->dr_pos[i] = v;
+        }
+        uint16_t v = a->cost_stopped;
+        a->cost_stopped = a->dr_stopped;
+        a->dr_stopped = v;
+        measure(a, &w1);
+        for (uint8_t i = 0; i < 16; i++)
+        {
+            v = a->cost_curpos[i];
+            a->cost_curpos[i] = a->dr_pos[i];
+            a->dr_pos[i] = v;
+        }
+        v = a->cost_stopped;
+        a->cost_stopped = a->dr_stopped;
+        a->dr_stopped = v;
+        q = REC(1);
+    }
+    if (same)
+    {
+        const int16_t *n = REC(0);
+        const uint16_t *cp = a->cost_curpos, *dp = a->dr_pos;
+        uint16_t sx = a->cost_stopped ^ a->dr_stopped;
+        for (uint8_t i = 16; i; i--, n += 4, q += 4, sx >>= 1)
+        {
+            if (*cp++ == *dp++ && !(sx & 1) && n[0] == q[0] && n[1] == q[1] && n[2] == q[2] && n[3] == q[3])
+                continue;
+            if (n[1] != 0x7FFF)
+            {
+                if (n[1] < bt0) bt0 = n[1];
+                if (n[3] > bb0) bb0 = n[3];
+            }
+            if (q[1] != 0x7FFF)
+            {
+                if (q[1] < bt0) bt0 = q[1];
+                if (q[3] > bb0) bb0 = q[3];
+            }
+        }
+    }
+    meas_rec = 0;
+    spr_off();
+    if (same && bb0 < 0)   /* сменились только невидимые конечности */
+    {
+        draw_left = w.l;
+        draw_right = w.r;
+        return 1;
+    }
+    if (w.r <= w.l || w.b <= w.t) w = *o;
+    else rect_union(&w, o);
+    if (same)
+    {
+        if (w.t < bt0) w.t = bt0;
+        if (w.b > bb0) w.b = bb0;
+    }
+    if (w.r <= w.l || w.b <= w.t || !cv_open(w.l, w.t, w.r, w.b)) return 0;
+    if (o->r > o->l) cv_bgrect(o);
+    prev_keep = a->number;
+    drawActorCostume(a);
+    prev_keep = 0;
+    cv_close();
+    prev_store(a->number);   /* REC(0) — прогон этого кадра */
+    return 1;
+}
+
+static uint8_t rect_overlap(const struct DrawnRect *p, const struct DrawnRect *q)
+{
+    return p->r > p->l && q->r > q->l && p->l < q->r && q->l < p->r && p->t < q->b && q->t < p->b;
+}
+
+/* actor.cpp: ScummEngine::processActors с resetActorBgs/setActorRedrawFlags:
+ * перерисовываются изменившиеся актёры (R) и задетые восстановлением фона под
+ * ними; актёр ближе к экрану, на которого лёг новый кадр из R, — поверх */
+/* биты полос экрана, занятых прошлым кадром актёра (gfxUsageBits) */
+static void strips_mark(uint8_t num, uint8_t set)
+{
+    const struct DrawnRect *d = &drawn[num];
+    int16_t l = d->l + xstart, r = d->r + xstart + 7;
+    if (r <= l || l < 0) return;
+    int16_t o = xstart >> 3, s0 = (int16_t)((uint16_t)l >> 3) - o, s1 = (int16_t)((uint16_t)r >> 3) - o;
+    if (s0 < 0) s0 = 0;
+    if (s1 > 41) s1 = 41;
+    uint8_t m = (uint8_t)(1u << (num & 7));
+    uint8_t *p = &strip_usage[s0][num >> 3];
+    for (; s0 < s1; s0++, p += 4)
+        if (set) *p |= m;
+        else *p &= (uint8_t)~m;
+}
+#define strips_clear(num) strips_mark(num, 0)
+
+/* markRectAsDirty всех конечностей: drawn и gfxUsageBits по последней отрисовке */
+static void mark_drawn(uint8_t num, const struct Actor *a)
+{
+    if (a->bottom <= a->top || draw_right <= draw_left) return;
+    struct DrawnRect *d = &drawn[num];
+    d->l = draw_left;
+    d->r = draw_right;
+    d->t = a->top;
+    d->b = a->bottom;
+    strips_mark(num, 1);
+}
+
+/* в общий холст: перерисовываемые с прежним кадром, пересекающиеся с кем-то */
+#define GRP(i) (R[i] && drawn[i].r > drawn[i].l && late[i].r <= late[i].l)
+
+void processActors(void)
+{
+    pal_a = 0;
+    uint8_t flushed = gfx_view_flush();   /* и край вида view_x */
+    if (xstart != view_x)   /* сдвиг вида: актёры — все заново, полосы — от нового края */
+    {
+        for (uint8_t i = 0; i < sizeof strip_usage; i++) ((uint8_t *)strip_usage)[i] = 0;
+        xstart = view_x;
+    }
+    view0 = bk_x(xstart);
+    target_screen();
+#ifndef HOST
+    spr_budget = SPR_BUILDS;
+#endif
+    uint8_t view_redrawn = flushed == 1;   /* вся видимая часть: старых актёров уже нет */
+    /* актёры, которых касается кадр: в комнате (ract, по возрастанию номеров — порядок
+     * рисования при равных y как в ScummVM) и ушедшие из неё с прошлым кадром на экране
+     * (среди нарисованных в прошлый раз, pl) */
+    uint8_t L[NUM_ACTORS], nl = 0, R[NUM_ACTORS], P[NUM_ACTORS], any = 0;
+    ract_build();
+    for (uint8_t k = 0; k < nract; k++) L[nl++] = ract[k];
+    for (uint8_t k = 0; k < npl; k++)
+        if (actors[pl[k]].room != currentRoom) L[nl++] = pl[k];
+    for (uint8_t p = 0; p < nl; p++)
+    {
+        uint8_t i = L[p];
+        struct Actor *a = &actors[i];
+        uint8_t was = drawn[i].r > drawn[i].l;
+        R[i] = P[i] = flushed != 0 || (a->room == currentRoom && a->visible && a->needRedraw) || (was && a->needBgReset);
+        any |= R[i];   /* P — сменившиеся сами (без задетых ими) */
+    }
+    if (!any)
+    {
+        animate_only();
+        return;
+    }
+    uint8_t cv = !lt_mode;   /* в темноте — на экране (фон — bg_vram) */
+    if (!cv) cursor_hide();
+    /* фон под R затрёт пересекающихся с ними */
+    for (uint8_t grown = 1; grown;)
+    {
+        grown = 0;
+        for (uint8_t p = 0; p < nl; p++)
+            if (R[L[p]])
+                for (uint8_t q = 0; q < nl; q++)
+                    if (!R[L[q]] && rect_overlap(&drawn[L[p]], &drawn[L[q]])) R[L[q]] = grown = 1;
+    }
+    /* актёр, ни с кем не пересекавшийся, — в своём окне (фон под прежним кадром —
+     * там же или прямо перед отрисовкой) */
+    struct DrawnRect late[NUM_ACTORS];
+    for (uint8_t p = 0; p < nl; p++)   /* до обнуления drawn: иначе второй из пары — «одинокий» */
+    {
+        uint8_t i = L[p];
+        late[i].l = late[i].r = 0;
+        if (!R[i] || view_redrawn || drawn[i].r <= drawn[i].l) continue;
+        uint8_t alone = actors[i].room == currentRoom && actors[i].visible;
+        for (uint8_t q = 0; q < nl && alone; q++)
+            if (L[q] != i && rect_overlap(&drawn[i], &drawn[L[q]])) alone = 0;
+        if (alone) late[i] = drawn[i];
+    }
+    /* пересекавшиеся — в общем холсте (R = 2): окно — прежние и новые кадры
+     * сменившихся (P), фон под их прежними кадрами; задетые ими соседи рисуются в
+     * нём с обрезкой (вне окна на экране они те же) */
+    uint8_t grp = 0;
+    if (cv && !view_redrawn)
+    {
+        struct DrawnRect u = { 0x7FFF, 0x7FFF, -0x7FFF, -0x7FFF }, nw;
+        for (uint8_t p = 0; p < nl; p++)
+        {
+            uint8_t i = L[p];
+            if (!GRP(i)) continue;
+            grp = 1;
+            if (!P[i]) continue;
+            rect_union(&u, &drawn[i]);
+            if (actors[i].room == currentRoom && actors[i].visible)
+            {
+                spr_on();
+                measure(&actors[i], &nw);
+                spr_off();
+                rect_union(&u, &nw);
+            }
+        }
+        if (grp && u.r > u.l && cv_open(u.l, u.t, u.r, u.b))
+        {
+            for (uint8_t p = 0; p < nl; p++)
+            {
+                uint8_t i = L[p];
+                if (!GRP(i)) continue;
+                if (P[i]) cv_bgrect(&drawn[i]);
+                R[i] = 2;
+            }
+        }
+        else
+            grp = 0;
+    }
+    for (uint8_t p = 0; p < nl; p++)
+    {
+        uint8_t i = L[p];
+        if (!R[i]) continue;
+        if (R[i] == 1 && !view_redrawn && drawn[i].r > drawn[i].l && late[i].r <= late[i].l)
+        {
+            restoreRect(drawn[i].l, drawn[i].t, drawn[i].r, drawn[i].b);
+            for (uint8_t q = 0; q < nl; q++)   /* задетые: перерисовывать только целиком */
+                if (L[q] != i && rect_overlap(&drawn[i], &drawn[L[q]])) actors[L[q]].dr_cost = 0;
+        }
+        strips_clear(i);
+        drawn[i].l = drawn[i].r = 0;
+        actors[i].needBgReset = 0;
+    }
+    /* актёры комнаты — от дальних к ближним (порядок обменов — как в ScummVM) */
+    uint8_t sorted[NUM_ACTORS], n = 0;
+    for (uint8_t p = 0; p < nl; p++)
+        if (actors[L[p]].room == currentRoom) sorted[n++] = L[p];
+    for (uint8_t j = 0; j < n; ++j)
+        for (uint8_t i = 0; i < n; ++i)
+            if (actors[sorted[j]].y < actors[sorted[i]].y)
+            {
+                uint8_t t = sorted[i];
+                sorted[i] = sorted[j];
+                sorted[j] = t;
+            }
+    if (grp)
+    {
+        for (uint8_t k = 0; k < n; k++)
+        {
+            struct Actor *a = &actors[sorted[k]];
+            if (R[sorted[k]] != 2 || !a->costume || !a->visible) continue;
+            a->needRedraw = 1;
+            drawActorCostume(a);
+            mark_drawn(sorted[k], a);
+        }
+        cv_close();
+    }
+    static const struct DrawnRect none;
+    for (uint8_t k = 0; k < n; k++)
+    {
+        uint8_t num = sorted[k];
+        struct Actor *a = &actors[num];
+        if (!a->costume) continue;
+        if (R[num] == 2)
+        {
+            animateCostume(a);
+            continue;
+        }
+        if (!R[num])
+            for (uint8_t q = 0; q < k; q++)   /* дальше него перерисован и лёг на него */
+                if (R[sorted[q]] && rect_overlap(&drawn[sorted[q]], &drawn[num]))
+                {
+                    R[num] = 1;
+                    strips_clear(num);
+                    drawn[num].l = drawn[num].r = 0;
+                    break;
+                }
+        uint8_t done = 0;
+        if (late[num].r > late[num].l)
+        {
+            if (R[num] && a->visible)
+            {
+                a->needRedraw = 1;
+                if (cv) done = draw_via_canvas(a, &late[num], !flushed);
+            }
+            if (!done)
+            {
+                restoreRect(late[num].l, late[num].t, late[num].r, late[num].b);
+                for (uint8_t q = k + 1; q < n; q++)   /* дальше по порядку: только целиком */
+                    if (rect_overlap(&late[num], &late[sorted[q]]) || rect_overlap(&late[num], &drawn[sorted[q]]))
+                        actors[sorted[q]].dr_cost = 0;
+            }
+        }
+        if (R[num] && a->visible)
+        {
+            if (!done)
+            {
+                a->needRedraw = 1;   /* setActorRedrawFlags: фон под ним восстановлен */
+                if (cv) done = draw_via_canvas(a, &none, 0);
+                if (!done)
+                {
+                    cursor_hide();
+                    drawActorCostume(a);
+                }
+            }
+            mark_drawn(num, a);
+        }
+        animateCostume(a);
+    }
+    /* перед поздним восстановлением фона под A мог уже лечь новый кадр актёра
+     * дальше него — тот перерисуется в следующем шаге */
+    for (uint8_t k = 0; k < n; k++)
+    {
+        uint8_t num = sorted[k];
+        if (late[num].r <= late[num].l) continue;
+        for (uint8_t q = 0; q < k; q++)
+            if (rect_overlap(&late[num], &drawn[sorted[q]]))
+            {
+                actors[sorted[q]].needRedraw = 1;
+                actors[sorted[q]].dr_cost = 0;   /* фон лёг на него: только целиком */
+            }
+    }
+    npl = 0;
+    for (uint8_t p = 0; p < nl; p++)
+        if (drawn[L[p]].r > drawn[L[p]].l) pl[npl++] = L[p];
+}
+
+/* экран очищен и перерисован целиком (чтение файла, загрузка игры): прошлых
+ * кадров актёров на нём нет — нарисовать всех заново */
+void actors_redraw_all(void)
+{
+    for (uint8_t i = 0; i < NUM_ACTORS; i++)
+    {
+        drawn[i].l = drawn[i].r = 0;
+        actors[i].needRedraw = 1;
+        actors[i].needBgReset = 0;
+        actors[i].dr_cost = 0;
+    }
+    for (uint8_t i = 0; i < sizeof strip_usage; i++) ((uint8_t *)strip_usage)[i] = 0;
+}
