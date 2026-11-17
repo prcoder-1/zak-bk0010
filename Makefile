@@ -1,6 +1,6 @@
 # Zak McKracken (SCUMM v2) для БК-0011М + СМК-512 + AY: ядро в базовом ОЗУ, общая
 # копия кода (REPL) во всех страницах ДОЗУ, банки кода A..D в своих страницах
-VERSION=0.1
+VERSION=0.2
 IMG=ZAK_$(VERSION).IMG
 BUILD_DATE=$(shell date +%d.%m.%Y)
 XGCC=/home/prcoder/xgcc
