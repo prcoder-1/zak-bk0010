@@ -76,7 +76,7 @@ def main():
             k, r = divmod(at + i, csize)
             img[data_off + (chain[k] - 2) * csize + r] = b
 
-    code = [w for n in ('REPL', 'BANKA', 'BANKB', 'BANKC', 'BANKD', 'SNDDRV') for w in entry(n)]
+    code = [w for n in ('REPL', 'BANKA', 'BANKB', 'BANKC', 'BANKD', 'SNDDRV', 'AZMOD') for w in entry(n)]
     patch('ZAK', sym(kmap, 'code_ft') - 0o760, code)
     nrooms = next(int(l.split()[2]) for l in open('scumm.h') if l.startswith('#define NUM_ROOMS '))
     lfl = [w for r in range(nrooms) for w in entry('%02d.LFL' % r)]
